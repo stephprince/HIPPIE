@@ -12,6 +12,129 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+
+
+def perform_knn_classification(embeddings, labels, label_names, dataset_name, embedding_type, output_dir, test_size=0.2):
+    """
+    Perform KNN classification on embeddings and save predictions.
+    
+    Args:
+        embeddings: numpy array of embeddings
+        labels: numpy array of true labels
+        label_names: list of label names
+        dataset_name: name of the dataset
+        embedding_type: type of embedding ('waveform', 'isi', 'joint')
+        output_dir: directory to save results
+        test_size: proportion of data to use for testing
+    
+    Returns:
+        dict with results including best accuracy, best neighbors, and predictions
+    """
+    # Skip if we only have one class
+    unique_labels = np.unique(labels)
+    if len(unique_labels) <= 1:
+        print(f"  - Skipping {embedding_type} KNN: only one class found")
+        return None
+    
+    # Check if we can do stratified splitting
+    # Count samples per class
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    min_samples_per_class = np.min(counts)
+    
+    # If any class has only 1 sample, we can't do stratified splitting
+    if min_samples_per_class < 2:
+        print(f"  - Warning: Some classes have only 1 sample. Using random split instead of stratified.")
+        X_train, X_test, y_train, y_test = train_test_split(
+            embeddings, labels, test_size=test_size, random_state=42, stratify=None
+        )
+    else:
+        # Use stratified splitting
+        X_train, X_test, y_train, y_test = train_test_split(
+            embeddings, labels, test_size=test_size, random_state=42, stratify=labels
+        )
+    
+    # Test different numbers of neighbors
+    neighbor_options = list(range(5, min(20, len(X_train))))  # Don't exceed training samples
+    if len(neighbor_options) == 0:
+        neighbor_options = [min(3, len(X_train) - 1)]  # Fallback for very small datasets
+    
+    bal_accuracies = []
+    
+    for n_neighbors in neighbor_options:
+        if n_neighbors >= len(X_train):
+            continue
+            
+        knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+        knn.fit(X_train, y_train)
+        y_pred = knn.predict(X_test)
+        bal_acc = balanced_accuracy_score(y_test, y_pred)
+        bal_accuracies.append(bal_acc)
+    
+    if len(bal_accuracies) == 0:
+        print(f"  - Skipping {embedding_type} KNN: insufficient data")
+        return None
+    
+    # Find best number of neighbors
+    best_idx = np.argmax(bal_accuracies)
+    best_neighbors = neighbor_options[best_idx]
+    best_accuracy = bal_accuracies[best_idx]
+    
+    # Train final model with best parameters
+    knn = KNeighborsClassifier(n_neighbors=best_neighbors)
+    knn.fit(X_train, y_train)
+    y_pred = knn.predict(X_test)
+    
+    # Generate confusion matrix
+    conf_matrix = confusion_matrix(y_test, y_pred, labels=unique_labels)
+    
+    # Convert labels back to original names if available
+    if label_names is not None:
+        y_test_names = [label_names[int(i)] for i in y_test]
+        y_pred_names = [label_names[int(i)] for i in y_pred]
+    else:
+        y_test_names = y_test.astype(str)
+        y_pred_names = y_pred.astype(str)
+    
+    # Save predictions
+    predictions_df = pd.DataFrame({
+        'true': y_test_names,
+        'pred': y_pred_names,
+        'true_encoded': y_test,
+        'pred_encoded': y_pred
+    })
+    
+    predictions_path = os.path.join(output_dir, f"{dataset_name}_{embedding_type}_knn_predictions.csv")
+    predictions_df.to_csv(predictions_path, index=False)
+    
+    # Save performance summary
+    summary_df = pd.DataFrame({
+        'embedding_type': [embedding_type],
+        'best_neighbors': [best_neighbors],
+        'balanced_accuracy': [best_accuracy],
+        'n_train_samples': [len(X_train)],
+        'n_test_samples': [len(X_test)],
+        'n_classes': [len(unique_labels)]
+    })
+    
+    summary_path = os.path.join(output_dir, f"{dataset_name}_{embedding_type}_knn_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    
+    print(f"  - {embedding_type.title()} KNN: {best_accuracy:.3f} accuracy with {best_neighbors} neighbors")
+    print(f"  - Saved predictions to {predictions_path}")
+    print(f"  - Saved summary to {summary_path}")
+    
+    return {
+        'embedding_type': embedding_type,
+        'best_neighbors': best_neighbors,
+        'balanced_accuracy': best_accuracy,
+        'confusion_matrix': conf_matrix,
+        'predictions': predictions_df,
+        'neighbor_options': neighbor_options,
+        'all_accuracies': bal_accuracies
+    }
 
 
 class EphysDatasetWithSourceLabels(Dataset):
@@ -103,6 +226,12 @@ parser.add_argument(
     type=int,
     default=10,
     help="Minimum frequency for a label to be displayed individually"
+)
+parser.add_argument(
+    '--test-size',
+    type=float,
+    default=0.2,
+    help="Proportion of data to use for testing in KNN classification (default: 0.2)"
 )
 
 args = parser.parse_args()
@@ -265,6 +394,52 @@ for name, embeddings in zip(['waveform', 'isi', 'joint'],
     output_path = os.path.join(args.output_dir, f"{args.dataset}_{name}_embeddings.csv")
     df.to_csv(output_path, index=False)
     print(f"Saved {name} embeddings to {output_path}")
+
+# Perform KNN classification if we have labels
+if labels is not None and len(np.unique(labels)) > 1:
+    print("\nPerforming KNN classification...")
+    
+    knn_results = []
+    
+    # Perform KNN for each embedding type
+    for name, embeddings in zip(['waveform', 'isi', 'joint'], 
+                               [waveform_embeddings, isi_embeddings, joint_embeddings]):
+        print(f"Running KNN classification for {name} embeddings...")
+        result = perform_knn_classification(
+            embeddings, labels, label_names, args.dataset, name, args.output_dir, args.test_size
+        )
+        if result is not None:
+            knn_results.append(result)
+    
+    # Create overall summary
+    if knn_results:
+        print(f"\nKNN Classification Results Summary:")
+        print("=" * 50)
+        
+        summary_data = []
+        for result in knn_results:
+            summary_data.append({
+                'embedding_type': result['embedding_type'],
+                'balanced_accuracy': result['balanced_accuracy'],
+                'best_neighbors': result['best_neighbors']
+            })
+            print(f"{result['embedding_type'].title():>10}: {result['balanced_accuracy']:.3f} "
+                  f"(k={result['best_neighbors']})")
+        
+        # Save overall summary
+        overall_summary_df = pd.DataFrame(summary_data)
+        overall_summary_path = os.path.join(args.output_dir, f"{args.dataset}_knn_overall_summary.csv")
+        overall_summary_df.to_csv(overall_summary_path, index=False)
+        print(f"\nSaved overall KNN summary to {overall_summary_path}")
+        
+        # Find best performing embedding type
+        best_result = max(knn_results, key=lambda x: x['balanced_accuracy'])
+        print(f"\nBest performing embedding: {best_result['embedding_type']} "
+              f"({best_result['balanced_accuracy']:.3f} accuracy)")
+    
+    print("\nKNN classification completed!")
+else:
+    print("\nSkipping KNN classification: insufficient labels or only one class found")
 
 # Generate UMAP visualizations
 print("Generating UMAP visualizations...")
