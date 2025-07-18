@@ -92,6 +92,18 @@ parser.add_argument(
     default="./embeddings_results",
     help="Directory to save embeddings and visualizations"
 )
+parser.add_argument(
+    '--max-labels',
+    type=int,
+    default=12,
+    help="Maximum number of labels to display in UMAP plots (others grouped as 'Other')"
+)
+parser.add_argument(
+    '--min-frequency',
+    type=int,
+    default=10,
+    help="Minimum frequency for a label to be displayed individually"
+)
 
 args = parser.parse_args()
 accelerator = "gpu" if torch.cuda.is_available() else "cpu"
@@ -257,58 +269,201 @@ for name, embeddings in zip(['waveform', 'isi', 'joint'],
 # Generate UMAP visualizations
 print("Generating UMAP visualizations...")
 
-def create_umap_plot(embeddings, labels, title, output_path):
-    """Create a UMAP visualization of the embeddings."""
+def create_improved_umap_plot(embeddings, labels, label_names, title, output_path, 
+                             max_labels=12, min_frequency=10):
+    """Create an improved UMAP visualization with better label handling."""
     reducer = umap.UMAP(random_state=42)
     umap_embeddings = reducer.fit_transform(embeddings)
     
-    plt.figure(figsize=(10, 8))
-    if len(np.unique(labels)) > 1:
-        scatter = plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], 
-                             c=labels, cmap='tab10', alpha=0.7, s=10)
-        plt.colorbar(scatter, label='Label')
-    else:
-        plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], alpha=0.7, s=10)
+    # Handle single label case
+    unique_labels = np.unique(labels)
+    if len(unique_labels) <= 1:
+        plt.figure(figsize=(10, 8))
+        plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], 
+                   alpha=0.7, s=15, color='steelblue')
+        plt.title(title, fontsize=14, fontweight='bold')
+        plt.xlabel('UMAP 1', fontsize=12)
+        plt.ylabel('UMAP 2', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        return
     
-    plt.title(title)
-    plt.xlabel('UMAP 1')
-    plt.ylabel('UMAP 2')
+    # Count label frequencies
+    label_counts = pd.Series(labels).value_counts()
+    
+    # Determine which labels to show individually
+    if len(unique_labels) <= max_labels:
+        # Show all labels if we have few enough
+        labels_to_show = unique_labels
+        plot_labels = labels.copy()
+        plot_label_names = [label_names[int(i)] if label_names is not None else f"Label {int(i)}" 
+                           for i in labels_to_show]
+    else:
+        # Show top frequent labels, group others
+        frequent_labels = label_counts[label_counts >= min_frequency].head(max_labels - 1).index
+        
+        # Create new label array
+        plot_labels = labels.copy()
+        other_mask = ~np.isin(labels, frequent_labels)
+        plot_labels[other_mask] = -1  # Use -1 for "Other"
+        
+        # Create label names
+        plot_label_names = []
+        labels_to_show = list(frequent_labels) + [-1]
+        
+        for label in frequent_labels:
+            if label_names is not None:
+                name = label_names[int(label)]
+            else:
+                name = f"Label {int(label)}"
+            plot_label_names.append(f"{name} (n={label_counts[label]})")
+        
+        # Add "Other" category
+        other_count = np.sum(other_mask)
+        plot_label_names.append(f"Other (n={other_count})")
+    
+    # Choose color palette based on number of categories
+    n_categories = len(labels_to_show)
+    if n_categories <= 10:
+        colors = plt.cm.tab10(np.linspace(0, 1, 10))[:n_categories]
+    elif n_categories <= 20:
+        colors = plt.cm.tab20(np.linspace(0, 1, 20))[:n_categories]
+    else:
+        colors = plt.cm.viridis(np.linspace(0, 1, n_categories))
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Plot each category
+    for i, label in enumerate(labels_to_show):
+        mask = plot_labels == label
+        if np.any(mask):
+            ax.scatter(umap_embeddings[mask, 0], umap_embeddings[mask, 1], 
+                      c=[colors[i]], label=plot_label_names[i], 
+                      alpha=0.7, s=15, edgecolors='none')
+    
+    # Customize the plot
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xlabel('UMAP 1', fontsize=12)
+    ax.set_ylabel('UMAP 2', fontsize=12)
+    
+    # Add legend with better positioning
+    if n_categories <= 15:
+        legend = ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', 
+                          frameon=True, fancybox=True, shadow=True)
+    else:
+        # For many categories, use a more compact legend
+        legend = ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', 
+                          frameon=True, fancybox=True, shadow=True,
+                          ncol=2 if n_categories > 20 else 1)
+    
+    # Improve legend appearance
+    legend.get_frame().set_facecolor('white')
+    legend.get_frame().set_alpha(0.9)
+    
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
+    
+    # Print summary
+    print(f"  - Plotted {n_categories} categories")
+    if len(unique_labels) > max_labels:
+        print(f"  - Grouped {np.sum(other_mask)} samples into 'Other' category")
+
+def create_umap_plot(embeddings, labels, title, output_path):
+    """Legacy function for backward compatibility."""
+    create_improved_umap_plot(embeddings, labels, None, title, output_path)
 
 # Generate UMAP plots for each embedding type
 for name, embeddings in zip(['waveform', 'isi', 'joint'], 
                            [waveform_embeddings, isi_embeddings, joint_embeddings]):
     output_path = os.path.join(args.output_dir, f"{args.dataset}_{name}_umap.png")
-    create_umap_plot(embeddings, labels, f"{args.dataset} {name} embeddings", output_path)
+    print(f"Creating {name} UMAP visualization...")
+    create_improved_umap_plot(embeddings, labels, label_names, 
+                             f"{args.dataset.replace('-', ' ').title()} - {name.title()} Embeddings", 
+                             output_path, max_labels=args.max_labels, 
+                             min_frequency=args.min_frequency)
     print(f"Saved {name} UMAP visualization to {output_path}")
 
-# Optional: Generate paired comparisons between modalities
+# Optional: Generate improved paired comparisons between modalities
 if labels is not None and len(np.unique(labels)) > 1:
-    print("Generating comparison plots...")
+    print("Generating improved comparison plots...")
     
-    # Create a figure with three subplots for the three modalities
-    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+    # Prepare label data for consistent visualization across subplots
+    unique_labels = np.unique(labels)
+    label_counts = pd.Series(labels).value_counts()
+    
+    # Determine which labels to show (same logic as individual plots)
+    if len(unique_labels) <= args.max_labels:
+        labels_to_show = unique_labels
+        plot_labels = labels.copy()
+        plot_label_names = [label_names[int(i)] if label_names is not None else f"Label {int(i)}" 
+                           for i in labels_to_show]
+    else:
+        frequent_labels = label_counts[label_counts >= args.min_frequency].head(args.max_labels - 1).index
+        plot_labels = labels.copy()
+        other_mask = ~np.isin(labels, frequent_labels)
+        plot_labels[other_mask] = -1
+        
+        plot_label_names = []
+        labels_to_show = list(frequent_labels) + [-1]
+        
+        for label in frequent_labels:
+            if label_names is not None:
+                name = label_names[int(label)]
+            else:
+                name = f"Label {int(label)}"
+            plot_label_names.append(f"{name}")
+        
+        other_count = np.sum(other_mask)
+        plot_label_names.append(f"Other")
+    
+    # Choose consistent colors
+    n_categories = len(labels_to_show)
+    if n_categories <= 10:
+        colors = plt.cm.tab10(np.linspace(0, 1, 10))[:n_categories]
+    elif n_categories <= 20:
+        colors = plt.cm.tab20(np.linspace(0, 1, 20))[:n_categories]
+    else:
+        colors = plt.cm.viridis(np.linspace(0, 1, n_categories))
+    
+    # Create the comparison figure
+    fig, axs = plt.subplots(1, 3, figsize=(20, 6))
     
     for idx, (name, embeddings) in enumerate(zip(['waveform', 'isi', 'joint'], 
                                                [waveform_embeddings, isi_embeddings, joint_embeddings])):
         reducer = umap.UMAP(random_state=42)
         umap_embeddings = reducer.fit_transform(embeddings)
         
-        scatter = axs[idx].scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], 
-                         c=labels, cmap='tab10', alpha=0.7, s=10)
-        axs[idx].set_title(f"{name} embeddings")
-        axs[idx].set_xlabel('UMAP 1')
-        axs[idx].set_ylabel('UMAP 2')
+        # Plot each category with consistent colors
+        for i, label in enumerate(labels_to_show):
+            mask = plot_labels == label
+            if np.any(mask):
+                axs[idx].scatter(umap_embeddings[mask, 0], umap_embeddings[mask, 1], 
+                               c=[colors[i]], label=plot_label_names[i] if idx == 0 else "", 
+                               alpha=0.7, s=12, edgecolors='none')
+        
+        axs[idx].set_title(f"{name.title()} Embeddings", fontsize=12, fontweight='bold')
+        axs[idx].set_xlabel('UMAP 1', fontsize=10)
+        axs[idx].set_ylabel('UMAP 2', fontsize=10)
     
-    # Add a colorbar
-    cbar = fig.colorbar(scatter, ax=axs, label='Label')
+    # Add a single legend for all subplots
+    if n_categories <= 15:
+        fig.legend(bbox_to_anchor=(1.02, 0.5), loc='center left', 
+                  frameon=True, fancybox=True, shadow=True)
+    else:
+        fig.legend(bbox_to_anchor=(1.02, 0.5), loc='center left', 
+                  frameon=True, fancybox=True, shadow=True, ncol=2)
     
+    plt.suptitle(f"{args.dataset.replace('-', ' ').title()} - Modality Comparison", 
+                fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
+    
     output_path = os.path.join(args.output_dir, f"{args.dataset}_comparison_umap.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Saved comparison visualization to {output_path}")
+    print(f"Saved improved comparison visualization to {output_path}")
+    print(f"  - Comparison plot shows {n_categories} categories across all modalities")
 
 print("Inference completed successfully!")

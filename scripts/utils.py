@@ -11,10 +11,13 @@ def make_confmat(cm, label_names, best_neighbors_waveform):
     normalized_cm = cm / cm.sum(axis=1)[:, np.newaxis]
 
     # Create annotations with both normalized values and raw counts
-    annotations = np.empty_like(normalized_cm).astype(str)
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            annotations[i, j] = f"{normalized_cm[i, j]:.2f}\n({cm[i, j]})"
+    if len(label_names) <= 10:
+        annotations = np.empty_like(normalized_cm).astype(str)
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                annotations[i, j] = f"{normalized_cm[i, j]:.2f}\n({cm[i, j]})"
+    else:
+        annotations = None
 
     # Create heatmap with blue color scheme
     ax = sns.heatmap(

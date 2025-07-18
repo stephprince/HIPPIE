@@ -66,6 +66,8 @@ def main():
                         help='Weight for the waveform modality loss in multimodal model')
     parser.add_argument('--mod2-weight', type=float, default=1.0,
                         help='Weight for the ISI modality loss in multimodal model')
+    parser.add_argument('--k-folds', type=int, default=5,
+                        help='Number of folds for cross validation (default: 5)')
     
     args = parser.parse_args()
     
@@ -87,7 +89,8 @@ def main():
         "juxtacellular-mouse-s1-area": 4,
         "allenscope-neuropixel": 3,
         "neonatal-mouse-brain-slice": 2,
-        "openscope-glo-celltype": 5,
+        "openscope-glo-celltype": 3,
+        "openscope-glo-area": 3,
     }
     
     all_dataset_files = dataset_files.copy()
@@ -101,6 +104,10 @@ def main():
     if "cellexplorer" in args.dataset:
         dataset_files.pop("cellexplorer-celltype", None)
         dataset_files.pop("cellexplorer-area", None)
+
+    if "openscope-glo" in args.dataset:
+        dataset_files.pop("openscope-glo-celltype", None)
+        dataset_files.pop("openscope-glo-area", None)
     
     # Load data for pretraining
     all_waveforms = []
@@ -354,7 +361,7 @@ def main():
         wandb.log_artifact(f"{args.output_dir}/pretraining_{args.dataset}_isi_embeddings.csv", name=f"pretraining_{args.dataset}_isi_embeddings.csv", type=f"pretraining_{args.dataset}_isi_embeddings.csv")
         wandb.log_artifact(f"{args.output_dir}/pretraining_{args.dataset}_joint_embeddings.csv", name=f"pretraining_{args.dataset}_joint_embeddings.csv", type=f"pretraining_{args.dataset}_joint_embeddings.csv")
         
-        # Load supervised data for training
+        # Load supervised data for k-fold cross validation
         dataset = args.dataset
         supervised_wf = pd.read_csv(f"datasets/{dataset}/waveforms.csv").to_numpy()
         supervised_isi = pd.read_csv(f"datasets/{dataset}/isi_dist.csv").to_numpy()
@@ -369,202 +376,310 @@ def main():
             supervised_labels = np.zeros(len(supervised_wf))
             le = LabelEncoder().fit(supervised_labels)
         
-        # Create train/val split for supervised learning
-        indices = list(range(len(supervised_wf)))
-        train_size = int(args.train_val_split * len(indices))
-        train_indices, val_indices = random_split(indices, [train_size, len(indices) - train_size])
+        num_class_labels = len(np.unique(supervised_labels))
+        print(f"Starting {args.k_folds}-fold cross validation with {num_class_labels} classes")
         
-        # Extract train/val data
-        wf_train = supervised_wf[train_indices]
-        wf_val = supervised_wf[val_indices]
-        isi_train = supervised_isi[train_indices]
-        isi_val = supervised_isi[val_indices]
-        label_train = supervised_labels[train_indices]
-        label_val = supervised_labels[val_indices]
+        # Initialize k-fold cross validation
+        skf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=42)
         
-        num_class_labels = len(np.unique(label_train))
-        wave_model.model.class_embedding = nn.Embedding(num_class_labels, wave_model.model.class_hidden_dim)
-        time_model.model.class_embedding = nn.Embedding(num_class_labels, time_model.model.class_hidden_dim)
+        # Storage for fold results
+        fold_results = {
+            'waveform_bal_acc': [],
+            'isi_bal_acc': [],
+            'joint_bal_acc': [],
+            'waveform_best_neighbors': [],
+            'isi_best_neighbors': [],
+            'joint_best_neighbors': [],
+            'waveform_confmats': [],
+            'isi_confmats': [],
+            'joint_confmats': []
+        }
         
-        label_train_for_embedding = all_dataset_files[dataset] * np.ones_like(label_train)
-        label_val_for_embedding = all_dataset_files[dataset] * np.ones_like(label_val)
-        
-        dataset_train_wave = EphysDatasetLabeled(
-            wf_train, isi_train, np.vstack((label_train, label_train_for_embedding)).T, mode="wave", normalize=False
-        )
-        dataset_train_time = EphysDatasetLabeled(
-            wf_train, isi_train, np.vstack((label_train, label_train_for_embedding)).T, mode="time", normalize=False
-        )
-        
-        dataset_val_wave = EphysDatasetLabeled(
-            wf_val, isi_val, np.vstack((label_val, label_val_for_embedding)).T, mode="wave", normalize=False
-        )
-        dataset_val_time = EphysDatasetLabeled(
-            wf_val, isi_val, np.vstack((label_val, label_val_for_embedding)).T, mode="time", normalize=False
-        )
-        
-        train_sampler = BalancedBatchSampler(dataset_train_wave, label_train)
-        train_loader_wave = torch.utils.data.DataLoader(
-            dataset_train_wave, batch_size=args.supervised_batch_size, sampler=train_sampler, num_workers=4
-        )
-        test_loader_wave = torch.utils.data.DataLoader(
-            dataset_val_wave, batch_size=args.supervised_batch_size, shuffle=False, num_workers=4
-        )
-        train_loader_time = torch.utils.data.DataLoader(
-            dataset_train_time, batch_size=args.supervised_batch_size, sampler=train_sampler, num_workers=4
-        )
-        test_loader_time = torch.utils.data.DataLoader(
-            dataset_val_time, batch_size=args.supervised_batch_size, shuffle=False, num_workers=4
-        )
-        
-        # Load models for supervised learning
-        wave_model = hippieUnimodalCVAE(z_dim=args.z_dim, output_size=50, class_hidden_dim=5, 
-                                        num_sources=num_sources, num_classes=num_class_labels)
-        time_model = hippieUnimodalCVAE(z_dim=args.z_dim, output_size=100, class_hidden_dim=5, 
-                                        num_sources=num_sources, num_classes=num_class_labels)
-        
-        wave_seq = torch.load(wave_path)
-        wave_seq["state_dict"].pop("model.class_embedding.weight")
-        wave_model = hippieUnimodalEmbeddingModelCVAE(wave_model, learning_rate=(1/10)*args.learning_rate, weight_decay=args.weight_decay)
-        wave_model.load_state_dict(wave_seq["state_dict"], strict=False)
-        
-        time_seq = torch.load(time_path)
-        time_seq["state_dict"].pop("model.class_embedding.weight")
-        time_model = hippieUnimodalEmbeddingModelCVAE(time_model, learning_rate=(1/10)*args.learning_rate, weight_decay=args.weight_decay)
-        time_model.load_state_dict(time_seq["state_dict"], strict=False)
-        
-        # Set up callbacks and loggers for supervised training
-        wave_modelcheckpoint = pl.callbacks.ModelCheckpoint(monitor="val_loss", save_top_k=1, mode="min", filename="wave_modelcheckpoint")
-        time_modelcheckpoint = pl.callbacks.ModelCheckpoint(monitor="val_loss", save_top_k=1, mode="min", filename="time_modelcheckpoint")
-        early_stop_wave = pl.callbacks.EarlyStopping(monitor="val_loss", patience=args.early_stopping_patience, mode="min")
-        early_stop_time = pl.callbacks.EarlyStopping(monitor="val_loss", patience=args.early_stopping_patience, mode="min")
-        lr_monitor_wave = pl.callbacks.LearningRateMonitor(logging_interval="step")
-        lr_monitor_time = pl.callbacks.LearningRateMonitor(logging_interval="step")
-        
-        wandb_logger1 = pl.loggers.WandbLogger(
-            project=project,
-            name=f"{args.wandb_tag}{args.dataset}finetune_wave_model_{dataset}",
-        )
-        trainer_wave = pl.Trainer(
-            max_epochs=args.supervised_max_epochs,
-            accelerator=accelerator,
-            logger=wandb_logger1,
-            callbacks=[wave_modelcheckpoint, early_stop_wave, lr_monitor_wave],
-            limit_train_batches=limit_train_batches,
-            limit_val_batches=limit_val_batches,
-            gradient_clip_val=args.gradient_clip_val,
-        )
-        trainer_wave.fit(wave_model, train_loader_wave, test_loader_wave)
-        
-        wandb_logger2 = pl.loggers.WandbLogger(
-            project=project,
-            name=f"{args.wandb_tag}{args.dataset}finetune_time_mode_{dataset}",
-        )
-        trainer_time = pl.Trainer(
-            max_epochs=args.supervised_max_epochs,
-            accelerator=accelerator,
-            logger=wandb_logger2,
-            callbacks=[time_modelcheckpoint, early_stop_time, lr_monitor_time],
-            limit_train_batches=limit_train_batches,
-            limit_val_batches=limit_val_batches,
-            gradient_clip_val=args.gradient_clip_val,
-        )
-        trainer_time.fit(time_model, train_loader_time, test_loader_time)
-        
-        # Load best models after supervised training
-        wave_path = wave_modelcheckpoint.best_model_path
-        time_path = time_modelcheckpoint.best_model_path
-        wandb.log({"best_epoch_waveform": wave_path, "best_epoch_time": time_path})
-        
-        wave_seq = torch.load(wave_path)
-        wave_model.load_state_dict(wave_seq["state_dict"])
-        wave_model.optimizer.load_state_dict(wave_seq["optimizer_states"][0])
-        
-        time_seq = torch.load(time_path)
-        time_model.load_state_dict(time_seq["state_dict"])
-        time_model.optimizer.load_state_dict(time_seq["optimizer_states"][0])
-        
-        time_model.eval()
-        wave_model.eval()
-        
-        # Get embeddings for evaluation
-        train_loader_wave = torch.utils.data.DataLoader(dataset_train_wave, batch_size=128)
-        train_loader_time = torch.utils.data.DataLoader(dataset_train_time, batch_size=128)
-        
-        waveform_embeddings_train, isi_dist_embeddings_train, joint_embeddings_train = get_embeddings(
-            train_loader_wave, train_loader_time, wave_model, time_model
-        )
-        
-        waveform_embeddings_test, isi_dist_embeddings_test, joint_embeddings_test = get_embeddings(
-            test_loader_wave, test_loader_time, wave_model, time_model
-        )
-        
-        # Evaluate using KNN with different neighbor counts
-        joint_bal_accuracy = []
-        waveform_bal_accuracy = []
-        isi_bal_accuracy = []
-        neighbor_options = list(range(5, 20))
-        
-        for neighbor in neighbor_options:
-            print("KNN with", neighbor, "neighbors")
+        # Perform k-fold cross validation
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(supervised_wf, supervised_labels)):
+            print(f"Training fold {fold_idx + 1}/{args.k_folds}")
             
-            # Joint embeddings
-            knn = KNeighborsClassifier(n_neighbors=neighbor)
-            knn.fit(joint_embeddings_train, label_train)
-            pred = knn.predict(joint_embeddings_test)
-            joint_bal_accuracy.append(balanced_accuracy_score(label_val, pred))
-        
-            # Waveform embeddings
-            knn = KNeighborsClassifier(n_neighbors=neighbor)
+            # Extract fold data
+            wf_train = supervised_wf[train_idx]
+            wf_val = supervised_wf[val_idx]
+            isi_train = supervised_isi[train_idx]
+            isi_val = supervised_isi[val_idx]
+            label_train = supervised_labels[train_idx]
+            label_val = supervised_labels[val_idx]
+            
+            # Create source labels for embedding
+            label_train_for_embedding = all_dataset_files[dataset] * np.ones_like(label_train)
+            label_val_for_embedding = all_dataset_files[dataset] * np.ones_like(label_val)
+            
+            # Create datasets for this fold
+            dataset_train_wave = EphysDatasetLabeled(
+                wf_train, isi_train, np.vstack((label_train, label_train_for_embedding)).T, mode="wave", normalize=False
+            )
+            dataset_train_time = EphysDatasetLabeled(
+                wf_train, isi_train, np.vstack((label_train, label_train_for_embedding)).T, mode="time", normalize=False
+            )
+            dataset_val_wave = EphysDatasetLabeled(
+                wf_val, isi_val, np.vstack((label_val, label_val_for_embedding)).T, mode="wave", normalize=False
+            )
+            dataset_val_time = EphysDatasetLabeled(
+                wf_val, isi_val, np.vstack((label_val, label_val_for_embedding)).T, mode="time", normalize=False
+            )
+            
+            # Create data loaders for this fold
+            train_sampler = BalancedBatchSampler(dataset_train_wave, label_train)
+            train_loader_wave = torch.utils.data.DataLoader(
+                dataset_train_wave, batch_size=args.supervised_batch_size, sampler=train_sampler, num_workers=4
+            )
+            test_loader_wave = torch.utils.data.DataLoader(
+                dataset_val_wave, batch_size=args.supervised_batch_size, shuffle=False, num_workers=4
+            )
+            train_loader_time = torch.utils.data.DataLoader(
+                dataset_train_time, batch_size=args.supervised_batch_size, sampler=train_sampler, num_workers=4
+            )
+            test_loader_time = torch.utils.data.DataLoader(
+                dataset_val_time, batch_size=args.supervised_batch_size, shuffle=False, num_workers=4
+            )
+            
+            # Initialize models for this fold
+            fold_wave_model = hippieUnimodalCVAE(z_dim=args.z_dim, output_size=50, class_hidden_dim=5, 
+                                                num_sources=num_sources, num_classes=num_class_labels)
+            fold_time_model = hippieUnimodalCVAE(z_dim=args.z_dim, output_size=100, class_hidden_dim=5, 
+                                                num_sources=num_sources, num_classes=num_class_labels)
+            
+            # Load pretrained weights
+            wave_seq = torch.load(wave_path)
+            wave_seq["state_dict"].pop("model.class_embedding.weight", None)
+            fold_wave_model = hippieUnimodalEmbeddingModelCVAE(fold_wave_model, learning_rate=(1/10)*args.learning_rate, weight_decay=args.weight_decay)
+            fold_wave_model.load_state_dict(wave_seq["state_dict"], strict=False)
+            
+            time_seq = torch.load(time_path)
+            time_seq["state_dict"].pop("model.class_embedding.weight", None)
+            fold_time_model = hippieUnimodalEmbeddingModelCVAE(fold_time_model, learning_rate=(1/10)*args.learning_rate, weight_decay=args.weight_decay)
+            fold_time_model.load_state_dict(time_seq["state_dict"], strict=False)
+            
+            # Set up callbacks for this fold
+            fold_wave_checkpoint = pl.callbacks.ModelCheckpoint(monitor="val_loss", save_top_k=1, mode="min", 
+                                                               filename=f"fold_{fold_idx}_wave_checkpoint")
+            fold_time_checkpoint = pl.callbacks.ModelCheckpoint(monitor="val_loss", save_top_k=1, mode="min", 
+                                                               filename=f"fold_{fold_idx}_time_checkpoint")
+            fold_early_stop_wave = pl.callbacks.EarlyStopping(monitor="val_loss", patience=args.early_stopping_patience, mode="min")
+            fold_early_stop_time = pl.callbacks.EarlyStopping(monitor="val_loss", patience=args.early_stopping_patience, mode="min")
+            fold_lr_monitor_wave = pl.callbacks.LearningRateMonitor(logging_interval="step")
+            fold_lr_monitor_time = pl.callbacks.LearningRateMonitor(logging_interval="step")
+            
+            # Train wave model for this fold
+            fold_wandb_logger_wave = pl.loggers.WandbLogger(
+                project=project,
+                name=f"{args.wandb_tag}{args.dataset}_fold_{fold_idx}_wave_model",
+            )
+            fold_trainer_wave = pl.Trainer(
+                max_epochs=args.supervised_max_epochs,
+                accelerator=accelerator,
+                logger=fold_wandb_logger_wave,
+                callbacks=[fold_wave_checkpoint, fold_early_stop_wave, fold_lr_monitor_wave],
+                limit_train_batches=limit_train_batches,
+                limit_val_batches=limit_val_batches,
+                gradient_clip_val=args.gradient_clip_val,
+            )
+            fold_trainer_wave.fit(fold_wave_model, train_loader_wave, test_loader_wave)
+            
+            # Train time model for this fold
+            fold_wandb_logger_time = pl.loggers.WandbLogger(
+                project=project,
+                name=f"{args.wandb_tag}{args.dataset}_fold_{fold_idx}_time_model",
+            )
+            fold_trainer_time = pl.Trainer(
+                max_epochs=args.supervised_max_epochs,
+                accelerator=accelerator,
+                logger=fold_wandb_logger_time,
+                callbacks=[fold_time_checkpoint, fold_early_stop_time, fold_lr_monitor_time],
+                limit_train_batches=limit_train_batches,
+                limit_val_batches=limit_val_batches,
+                gradient_clip_val=args.gradient_clip_val,
+            )
+            fold_trainer_time.fit(fold_time_model, train_loader_time, test_loader_time)
+            
+            # Load best models for this fold
+            fold_wave_path = fold_wave_checkpoint.best_model_path
+            fold_time_path = fold_time_checkpoint.best_model_path
+            
+            fold_wave_seq = torch.load(fold_wave_path)
+            fold_wave_model.load_state_dict(fold_wave_seq["state_dict"])
+            
+            fold_time_seq = torch.load(fold_time_path)
+            fold_time_model.load_state_dict(fold_time_seq["state_dict"])
+            
+            fold_wave_model.eval()
+            fold_time_model.eval()
+            
+            # Get embeddings for this fold
+            train_loader_wave_eval = torch.utils.data.DataLoader(dataset_train_wave, batch_size=128)
+            train_loader_time_eval = torch.utils.data.DataLoader(dataset_train_time, batch_size=128)
+            
+            waveform_embeddings_train, isi_dist_embeddings_train, joint_embeddings_train = get_embeddings(
+                train_loader_wave_eval, train_loader_time_eval, fold_wave_model, fold_time_model
+            )
+            
+            test_loader_wave_eval = torch.utils.data.DataLoader(dataset_val_wave, batch_size=128)
+            test_loader_time_eval = torch.utils.data.DataLoader(dataset_val_time, batch_size=128)
+            
+            waveform_embeddings_test, isi_dist_embeddings_test, joint_embeddings_test = get_embeddings(
+                test_loader_wave_eval, test_loader_time_eval, fold_wave_model, fold_time_model
+            )
+            
+            # Evaluate using KNN with different neighbor counts for this fold
+            joint_bal_accuracy = []
+            waveform_bal_accuracy = []
+            isi_bal_accuracy = []
+            neighbor_options = list(range(5, 20))
+            
+            for neighbor in neighbor_options:
+                # Joint embeddings
+                knn = KNeighborsClassifier(n_neighbors=neighbor)
+                knn.fit(joint_embeddings_train, label_train)
+                pred = knn.predict(joint_embeddings_test)
+                joint_bal_accuracy.append(balanced_accuracy_score(label_val, pred))
+            
+                # Waveform embeddings
+                knn = KNeighborsClassifier(n_neighbors=neighbor)
+                knn.fit(waveform_embeddings_train, label_train)
+                pred = knn.predict(waveform_embeddings_test)
+                waveform_bal_accuracy.append(balanced_accuracy_score(label_val, pred))
+            
+                # ISI embeddings
+                knn = KNeighborsClassifier(n_neighbors=neighbor)
+                knn.fit(isi_dist_embeddings_train, label_train)
+                pred = knn.predict(isi_dist_embeddings_test)
+                isi_bal_accuracy.append(balanced_accuracy_score(label_val, pred))
+            
+            # Get best results for this fold
+            best_neighbors_waveform = neighbor_options[np.argmax(waveform_bal_accuracy)]
+            best_neighbors_isi = neighbor_options[np.argmax(isi_bal_accuracy)]
+            best_neighbors_joint = neighbor_options[np.argmax(joint_bal_accuracy)]
+            
+            # Generate predictions and confusion matrices for this fold
+            # Use all possible labels to ensure consistent confusion matrix shapes
+            all_labels = np.unique(supervised_labels)
+            
+            knn = KNeighborsClassifier(n_neighbors=best_neighbors_waveform)
             knn.fit(waveform_embeddings_train, label_train)
-            pred = knn.predict(waveform_embeddings_test)
-            waveform_bal_accuracy.append(balanced_accuracy_score(label_val, pred))
-        
-            # ISI embeddings
-            knn = KNeighborsClassifier(n_neighbors=neighbor)
+            pred_waveform = knn.predict(waveform_embeddings_test)
+            confmat_waveform = confusion_matrix(label_val, pred_waveform, labels=all_labels)
+            
+            knn = KNeighborsClassifier(n_neighbors=best_neighbors_isi)
             knn.fit(isi_dist_embeddings_train, label_train)
-            pred = knn.predict(isi_dist_embeddings_test)
-            isi_bal_accuracy.append(balanced_accuracy_score(label_val, pred))
+            pred_isi = knn.predict(isi_dist_embeddings_test)
+            confmat_isi = confusion_matrix(label_val, pred_isi, labels=all_labels)
+            
+            knn = KNeighborsClassifier(n_neighbors=best_neighbors_joint)
+            knn.fit(joint_embeddings_train, label_train)
+            pred_joint = knn.predict(joint_embeddings_test)
+            confmat_joint = confusion_matrix(label_val, pred_joint, labels=all_labels)
+            
+            # Store fold results
+            fold_results['waveform_bal_acc'].append(np.max(waveform_bal_accuracy))
+            fold_results['isi_bal_acc'].append(np.max(isi_bal_accuracy))
+            fold_results['joint_bal_acc'].append(np.max(joint_bal_accuracy))
+            fold_results['waveform_best_neighbors'].append(best_neighbors_waveform)
+            fold_results['isi_best_neighbors'].append(best_neighbors_isi)
+            fold_results['joint_best_neighbors'].append(best_neighbors_joint)
+            fold_results['waveform_confmats'].append(confmat_waveform)
+            fold_results['isi_confmats'].append(confmat_isi)
+            fold_results['joint_confmats'].append(confmat_joint)
+            
+            # Save fold-specific results
+            wf_fold_dfs = {"pred": le.inverse_transform(pred_waveform.astype(int)), "true": le.inverse_transform(label_val.astype(int))}
+            isi_fold_dfs = {"pred": le.inverse_transform(pred_isi.astype(int)), "true": le.inverse_transform(label_val.astype(int))}
+            joint_fold_dfs = {"pred": le.inverse_transform(pred_joint.astype(int)), "true": le.inverse_transform(label_val.astype(int))}
+            
+            wf_fold_df = pd.DataFrame(wf_fold_dfs)
+            isi_fold_df = pd.DataFrame(isi_fold_dfs)
+            joint_fold_df = pd.DataFrame(joint_fold_dfs)
+            
+            wf_fold_df.to_csv(f"{args.output_dir}/{dataset}_fold_{fold_idx}_waveform_knn.csv")
+            isi_fold_df.to_csv(f"{args.output_dir}/{dataset}_fold_{fold_idx}_isi_knn.csv")
+            joint_fold_df.to_csv(f"{args.output_dir}/{dataset}_fold_{fold_idx}_joint_knn.csv")
+            
+            # Log fold-specific metrics to wandb
+            wandb.log({
+                f"fold_{fold_idx}_waveform_bal_acc": np.max(waveform_bal_accuracy),
+                f"fold_{fold_idx}_isi_bal_acc": np.max(isi_bal_accuracy),
+                f"fold_{fold_idx}_joint_bal_acc": np.max(joint_bal_accuracy),
+                f"fold_{fold_idx}_waveform_best_neighbors": best_neighbors_waveform,
+                f"fold_{fold_idx}_isi_best_neighbors": best_neighbors_isi,
+                f"fold_{fold_idx}_joint_best_neighbors": best_neighbors_joint,
+            })
+            
+            print(f"Fold {fold_idx + 1} completed - Waveform: {np.max(waveform_bal_accuracy):.3f}, ISI: {np.max(isi_bal_accuracy):.3f}, Joint: {np.max(joint_bal_accuracy):.3f}")
         
-        # Get best results and confusion matrices
+        # Aggregate results across all folds
         label_names = le.classes_
         
-        best_neighbors_waveform = neighbor_options[np.argmax(waveform_bal_accuracy)]
-        knn = KNeighborsClassifier(n_neighbors=best_neighbors_waveform)
-        knn.fit(waveform_embeddings_train, label_train)
-        pred_waveform = knn.predict(waveform_embeddings_test)
-        confmat_waveform = confusion_matrix(label_val, pred_waveform)
+        # Calculate mean and std of performance metrics
+        waveform_mean_acc = np.mean(fold_results['waveform_bal_acc'])
+        waveform_std_acc = np.std(fold_results['waveform_bal_acc'])
+        isi_mean_acc = np.mean(fold_results['isi_bal_acc'])
+        isi_std_acc = np.std(fold_results['isi_bal_acc'])
+        joint_mean_acc = np.mean(fold_results['joint_bal_acc'])
+        joint_std_acc = np.std(fold_results['joint_bal_acc'])
         
-        best_neighbors_isi = neighbor_options[np.argmax(isi_bal_accuracy)]
-        knn = KNeighborsClassifier(n_neighbors=best_neighbors_isi)
-        knn.fit(isi_dist_embeddings_train, label_train)
-        pred_isi = knn.predict(isi_dist_embeddings_test)
-        confmat_isi = confusion_matrix(label_val, pred_isi)
+        # Calculate average confusion matrices
+        avg_confmat_waveform = np.mean(fold_results['waveform_confmats'], axis=0)
+        avg_confmat_isi = np.mean(fold_results['isi_confmats'], axis=0)
+        avg_confmat_joint = np.mean(fold_results['joint_confmats'], axis=0)
         
-        best_neighbors_joint = neighbor_options[np.argmax(joint_bal_accuracy)]
-        knn = KNeighborsClassifier(n_neighbors=best_neighbors_joint)
-        knn.fit(joint_embeddings_train, label_train)
-        pred_joint = knn.predict(joint_embeddings_test)
-        confmat_joint = confusion_matrix(label_val, pred_joint)
+        # Save aggregated results
+        kfold_summary = {
+            'waveform_mean_acc': waveform_mean_acc,
+            'waveform_std_acc': waveform_std_acc,
+            'isi_mean_acc': isi_mean_acc,
+            'isi_std_acc': isi_std_acc,
+            'joint_mean_acc': joint_mean_acc,
+            'joint_std_acc': joint_std_acc,
+            'waveform_fold_accs': fold_results['waveform_bal_acc'],
+            'isi_fold_accs': fold_results['isi_bal_acc'],
+            'joint_fold_accs': fold_results['joint_bal_acc'],
+            'waveform_best_neighbors': fold_results['waveform_best_neighbors'],
+            'isi_best_neighbors': fold_results['isi_best_neighbors'],
+            'joint_best_neighbors': fold_results['joint_best_neighbors']
+        }
         
-        # Save results and log to wandb
-        wf_dfs = {"pred": le.inverse_transform(pred_waveform.astype(int)), "true": le.inverse_transform(label_val.astype(int))}
-        isi_dfs = {"pred": le.inverse_transform(pred_isi.astype(int)), "true": le.inverse_transform(label_val.astype(int))}
-        joint_dfs = {"pred": le.inverse_transform(pred_joint.astype(int)), "true": le.inverse_transform(label_val.astype(int))}
+        kfold_summary_df = pd.DataFrame([kfold_summary])
+        kfold_summary_df.to_csv(f"{args.output_dir}/{dataset}_kfold_summary.csv")
+        wandb.log_artifact(f"{args.output_dir}/{dataset}_kfold_summary.csv", name=f"{dataset}_kfold_summary.csv", type=f"{dataset}_kfold_summary.csv")
         
-        wf_df = pd.DataFrame(wf_dfs)
-        isi_df = pd.DataFrame(isi_dfs)
-        joint_df = pd.DataFrame(joint_dfs)
+        # Log aggregated metrics to wandb
+        wandb.log({
+            "kfold_waveform_mean_acc": waveform_mean_acc,
+            "kfold_waveform_std_acc": waveform_std_acc,
+            "kfold_isi_mean_acc": isi_mean_acc,
+            "kfold_isi_std_acc": isi_std_acc,
+            "kfold_joint_mean_acc": joint_mean_acc,
+            "kfold_joint_std_acc": joint_std_acc,
+        })
         
-        wf_df.to_csv(f"{args.output_dir}/{dataset}_waveform_knn.csv")
-        isi_df.to_csv(f"{args.output_dir}/{dataset}_isi_knn.csv")
-        joint_df.to_csv(f"{args.output_dir}/{dataset}_joint_knn.csv")
+        # Create confusion matrix figures for average results
+        avg_best_neighbors_waveform = int(np.mean(fold_results['waveform_best_neighbors']))
+        avg_best_neighbors_isi = int(np.mean(fold_results['isi_best_neighbors']))
+        avg_best_neighbors_joint = int(np.mean(fold_results['joint_best_neighbors']))
         
-        wandb.log_artifact(f"{args.output_dir}/{dataset}_waveform_knn.csv", name=f"{dataset}_waveform_knn.csv", type=f"{dataset}_waveform_knn.csv")
-        wandb.log_artifact(f"{args.output_dir}/{dataset}_isi_knn.csv", name=f"{dataset}_isi_knn.csv", type=f"{dataset}_isi_knn.csv")
-        wandb.log_artifact(f"{args.output_dir}/{dataset}_joint_knn.csv", name=f"{dataset}_joint_knn.csv", type=f"{dataset}_joint_knn.csv")
+        figure_waveform = make_confmat(avg_confmat_waveform, label_names, avg_best_neighbors_waveform)
+        figure_isi = make_confmat(avg_confmat_isi, label_names, avg_best_neighbors_isi)
+        figure_joint = make_confmat(avg_confmat_joint, label_names, avg_best_neighbors_joint)
         
-        # Save embeddings for all data
+        # Log average confusion matrices as images
+        wandb.log({
+            f"{dataset}_avg_confusion_matrix_waveform": wandb.Image(figure_waveform),
+            f"{dataset}_avg_confusion_matrix_isi": wandb.Image(figure_isi),
+            f"{dataset}_avg_confusion_matrix_joint": wandb.Image(figure_joint),
+        })
+        
+        print(f"\nK-fold Cross Validation Results:")
+        print(f"Waveform: {waveform_mean_acc:.3f} ± {waveform_std_acc:.3f}")
+        print(f"ISI: {isi_mean_acc:.3f} ± {isi_std_acc:.3f}")
+        print(f"Joint: {joint_mean_acc:.3f} ± {joint_std_acc:.3f}")
+        
+        # Save embeddings for all data using the last fold's models (use fold_wave_model and fold_time_model from last fold)
         all_wf_dataloader = torch.utils.data.DataLoader(
             EphysDatasetLabeled(supervised_wf, supervised_isi, 
                                 np.vstack((supervised_labels, np.ones_like(supervised_labels) * all_dataset_files[dataset])).T, 
@@ -580,7 +695,7 @@ def main():
         )
         
         wf_embeddings, isi_embeddings, joint_embeddings = get_embeddings(
-            all_wf_dataloader, all_isi_dataloader, wave_model, time_model
+            all_wf_dataloader, all_isi_dataloader, fold_wave_model, fold_time_model
         )
         
         wf_embeddings_df = pd.DataFrame(wf_embeddings)
@@ -599,29 +714,10 @@ def main():
         wandb.log_artifact(f"{args.output_dir}/{dataset}_isi_embeddings.csv", name=f"{dataset}_isi_embeddings.csv", type=f"{dataset}_isi_embeddings.csv")
         wandb.log_artifact(f"{args.output_dir}/{dataset}_joint_embeddings.csv", name=f"{dataset}_joint_embeddings.csv", type=f"{dataset}_joint_embeddings.csv")
         
-        # Upload models if requested
+        # Upload models if requested (use the pretrained models)
         if args.upload_model:
             wandb.log_artifact(wave_path, name=f'wave_model_ft_d{args.dataset}_z{args.z_dim}_lr{args.learning_rate}.pt', type='model')
             wandb.log_artifact(time_path, name=f'time_model_ft_d{args.dataset}_z{args.z_dim}_lr{args.learning_rate}.pt', type='model')
-        
-        # Log final metrics
-        wandb.log({
-            "best_balanced_accuracy_waveform": np.max(waveform_bal_accuracy),
-            "best_balanced_accuracy_isi": np.max(isi_bal_accuracy),
-            "best_balanced_accuracy_joint": np.max(joint_bal_accuracy),
-        })
-        
-        # Make confusion matrix figures
-        figure_waveform = make_confmat(confmat_waveform, label_names, best_neighbors_waveform)
-        figure_isi = make_confmat(confmat_isi, label_names, best_neighbors_isi)
-        figure_joint = make_confmat(confmat_joint, label_names, best_neighbors_joint)
-        
-        # Log confusion matrices as images
-        wandb.log({
-            f"{dataset}_confusion_matrix_waveform": wandb.Image(figure_waveform),
-            f"{dataset}_confusion_matrix_isi": wandb.Image(figure_isi),
-            f"{dataset}_confusion_matrix_joint": wandb.Image(figure_joint),
-        })
         
     else:
         #-----------------------------------------------------------------
